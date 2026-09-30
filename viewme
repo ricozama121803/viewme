@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+"""viewme - open any Markdown file in a clean, pretty popup window.
+
+Usage: viewme [options] FILE.md      (use "-" to read Markdown from stdin)
+
+No third-party packages are needed: Markdown is rendered by a built-in
+renderer, served from a tiny local web server, and shown in a chromium-style
+"app" window (no tabs or address bar). The page reloads when the file changes.
+"""
+
+import argparse
+import functools
+import html
+import http.server
+import json
+import mimetypes
+import os
+import posixpath
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import webbrowser
+from pathlib import Path
+
+VERSION = "1.0.0"
+DOC_SUFFIXES = (".md", ".markdown", ".mdown", ".mkd", ".txt")
+
+# --------------------------------------------------------------------------
+# Syntax highlighting (small and dependency free)
+# --------------------------------------------------------------------------
+
+HASH_LANGS = {"py", "python", "sh", "bash", "shell", "zsh", "console", "yaml", "yml", "toml", "ruby", "rb",
+              "make", "makefile", "dockerfile", "r", "perl", "ini", "conf", "nginx"}
+SLASH_LANGS = {"js", "javascript", "jsx", "ts", "typescript", "tsx", "c", "h", "cpp", "c++", "cc", "hpp", "java",
+               "go", "rust", "rs", "css", "scss", "swift", "kotlin", "kt", "cs", "csharp", "php", "dart", "scala",
+               "json", "jsonc", "glsl"}
+DASH_LANGS = {"sql", "lua", "haskell", "hs"}
+KEYWORDS = set("""
+if else elif elsif unless for foreach while do until switch case default break continue return yield pass
+def fn func function lambda class struct enum interface trait impl type typedef namespace module package
+import from export include require use using as with in is not and or new delete try catch except finally
+throw raise async await let const var static public private protected final abstract extends implements
+void int long short char float double bool boolean string true false null nil none None True False self this
+then fi esac done echo select from where join group order by insert update create table into values limit
+""".split())
+
+
+@functools.lru_cache(maxsize=8)
+def _highlight_regex(comment):
+    return re.compile(
+        r"(?P<c>%s)"
+        r"|(?P<s>\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)"
+        r"|(?P<n>\b0x[0-9a-fA-F]+\b|\b\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?\b)"
+        r"|(?P<k>\b[A-Za-z_][A-Za-z0-9_]*\b)" % comment, re.S)
+
+
+def highlight(code, lang):
+    lang = lang.lower()
+    if lang in HASH_LANGS:
+        comment = r"#[^\n]*"
+    elif lang in SLASH_LANGS:
+        comment = r"//[^\n]*|/\*.*?\*/"
+    elif lang in DASH_LANGS:
+        comment = r"--[^\n]*"
+    else:
+        return html.escape(code)
+    out, pos = [], 0
+    for m in _highlight_regex(comment).finditer(code):
+        out.append(html.escape(code[pos:m.start()]))
+        kind = m.lastgroup
+        text = html.escape(m.group(0))
+        if kind == "k" and m.group(0).lower() not in KEYWORDS:
+            out.append(text)
+        else:
+            out.append('<span class="t-%s">%s</span>' % (kind, text))
+        pos = m.end()
+    out.append(html.escape(code[pos:]))
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# Markdown renderer
+# --------------------------------------------------------------------------
+
+BLOCK_TAGS = {"address", "article", "aside", "blockquote", "center", "details", "div", "dl", "dt", "dd", "figcaption",
+              "figure", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p",
+              "section", "summary", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul"}
+INLINE_TAGS = {"a", "abbr", "b", "br", "code", "del", "em", "i", "img", "kbd", "s", "small", "span", "strong",
+               "sub", "sup", "u", "mark"}
+ALLOWED_TAGS = BLOCK_TAGS | INLINE_TAGS
+ALLOWED_ATTRS = {
+    "a": {"href", "title"},
+    "img": {"src", "alt", "title", "width", "height", "align"},
+    "td": {"align", "colspan", "rowspan"},
+    "th": {"align", "colspan", "rowspan"},
+    "details": {"open"},
+    "div": {"align"},
+    "p": {"align"},
+    "h1": {"align"}, "h2": {"align"}, "h3": {"align"},
+}
+LIST_RE = re.compile(r"^( {0,3})([*+-]|\d{1,9}[.)])( +|$)")
+FENCE_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})\s*([^\s`]*)[^`]*$")
+HEADING_RE = re.compile(r"^ {0,3}(#{1,6})(?:\s+(.*?))?(?:\s+#+)?\s*$")
+HR_RE = re.compile(r"^ {0,3}([-*_])(?: *\1){2,} *$")
+TABLE_DELIM_RE = re.compile(r"^ {0,3}\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$")
+ALERTS = {"NOTE": "Note", "TIP": "Tip", "IMPORTANT": "Important", "WARNING": "Warning", "CAUTION": "Caution"}
+
+
+def slugify(text):
+    s = html.unescape(re.sub(r"<[^>]+>", "", text)).strip().lower()
+    s = re.sub(r"[^\w\- ]", "", s).replace(" ", "-")
+    return s or "section"
+
+
+def indent_of(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+def split_row(line):
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith("\\|"):
+        line = line[:-1]
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", line)]
+
+
+class Renderer:
+    """Renders Markdown to sanitized HTML. Raw HTML is limited to a safe allowlist."""
+
+    def __init__(self):
+        self.headings = []
+        self.slugs = {}
+        self.refs = {}
+        self.cur_dir = "."
+
+    # ---- urls ----------------------------------------------------------
+
+    def make_url(self, url, image=False):
+        """Return a safe URL, rewriting relative paths to the local server, or None."""
+        url = html.unescape(url.strip())
+        if not url:
+            return None
+        low = url.lower()
+        if url.startswith("#") or low.startswith(("http://", "https://")):
+            return url
+        if low.startswith("mailto:"):
+            return None if image else url
+        if low.startswith("data:image/") and not low.startswith("data:image/svg"):
+            return url
+        if re.match(r"^[a-z][a-z0-9+.\-]*:", low) or url.startswith("//"):
+            return None
+        path, _, frag = url.partition("#")
+        path = urllib.parse.unquote(path.split("?")[0])
+        if not path:
+            return None
+        joined = posixpath.normpath(posixpath.join(self.cur_dir, path))
+        if joined.startswith("..") or joined.startswith("/"):
+            return None
+        quoted = urllib.parse.quote(joined)
+        if not image and joined.lower().endswith(DOC_SUFFIXES):
+            return "/doc/" + quoted + ("#" + frag if frag else "")
+        return "/raw/" + quoted
+
+    def anchor(self, href, inner, title=None):
+        safe = self.make_url(href)
+        if safe is None:
+            return inner
+        attrs = ' href="%s"' % html.escape(safe, quote=True)
+        if title:
+            attrs += ' title="%s"' % html.escape(title, quote=True)
+        if safe.lower().startswith(("http://", "https://")):
+            attrs += ' target="_blank" rel="noopener noreferrer"'
+        return "<a%s>%s</a>" % (attrs, inner)
+
+    # ---- raw html ------------------------------------------------------
+
+    def sanitize_tag(self, tag):
+        if tag.startswith("<!--"):
+            return ""
+        m = re.match(r"<\s*(/?)\s*([A-Za-z][A-Za-z0-9]*)(.*?)(/?)\s*>$", tag, re.S)
+        if not m or m.group(2).lower() not in ALLOWED_TAGS:
+            return html.escape(tag, quote=False)
+        closing, name, rest = m.group(1), m.group(2).lower(), m.group(3)
+        if closing:
+            return "</%s>" % name
+        allowed = ALLOWED_ATTRS.get(name, set())
+        attrs = ""
+        for am in re.finditer(r"([a-zA-Z_:][-\w:.]*)(?:\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'>]+)))?", rest):
+            key = am.group(1).lower()
+            val = next((g for g in am.groups()[1:] if g is not None), "")
+            if key not in allowed:
+                continue
+            if key in ("href", "src"):
+                val = self.make_url(val, image=(name == "img"))
+                if val is None:
+                    continue
+            if key == "open":
+                attrs += " open"
+            else:
+                attrs += ' %s="%s"' % (key, html.escape(html.unescape(val), quote=True))
+        if name == "a" and 'href="http' in attrs:
+            attrs += ' target="_blank" rel="noopener noreferrer"'
+        return "<%s%s>" % (name, attrs)
+
+    def raw_html(self, text):
+        parts = re.split(r"(<!--.*?-->|</?[A-Za-z][^<>]*>)", text, flags=re.S)
+        out = []
+        for i, part in enumerate(parts):
+            if i % 2:
+                out.append(self.sanitize_tag(part))
+            else:
+                out.append(re.sub(r"&(?!#?\w+;)", "&amp;", part).replace("<", "&lt;"))
+        return "".join(out)
+
+    # ---- inline --------------------------------------------------------
+
+    def inline(self, text):
+        stash = []
+
+        def put(s):
+            stash.append(s)
+            return "\x00%d\x00" % (len(stash) - 1)
+
+        text = text.replace("\x00", "")
+        text = re.sub(r"(?: {2,}|\\)\n", lambda m: put("<br>") + "\n", text)
+        text = re.sub(r"\\([\\`*_{}\[\]()#+\-.!|<>~])", lambda m: put(html.escape(m.group(1))), text)
+        text = re.sub(r"(`+)(?!`)(.+?)(?<!`)\1(?!`)",
+                      lambda m: put("<code>%s</code>" % html.escape(m.group(2).strip())), text, flags=re.S)
+        text = re.sub(r"<((?:https?://|mailto:)[^\s<>]+)>",
+                      lambda m: put(self.anchor(m.group(1), html.escape(m.group(1), quote=False))), text)
+        text = re.sub(r"<!--.*?-->|</?[A-Za-z][^<>]*>", lambda m: put(self.sanitize_tag(m.group(0))), text, flags=re.S)
+        text = html.escape(text, quote=False)
+
+        def image(m):
+            src = self.make_url(m.group(2), image=True)
+            if src is None:
+                return put(html.escape(m.group(1)))
+            title = ' title="%s"' % html.escape(html.unescape(m.group(3)), quote=True) if m.group(3) else ""
+            return put('<img src="%s" alt="%s"%s>' % (html.escape(src, quote=True),
+                                                       html.escape(html.unescape(m.group(1)), quote=True), title))
+
+        text = re.sub(r"!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+&quot;([^\"]*)&quot;|\s+\"([^\"]*)\")?\s*\)",
+                      lambda m: image(m), text)
+
+        def link(m):
+            title = m.group(3) or m.group(4)
+            return put(self.anchor(m.group(2), self.format(m.group(1)), html.unescape(title) if title else None))
+
+        text = re.sub(r"\[((?:[^\[\]]|\[[^\]]*\])*)\]\(\s*<?([^)\s>]*)>?(?:\s+&quot;([^\"]*)&quot;|\s+\"([^\"]*)\")?\s*\)",
+                      link, text)
+
+        def ref_link(m):
+            label = (m.group(2) or m.group(1)).strip().lower()
+            if label not in self.refs:
+                return m.group(0)
+            href, title = self.refs[label]
+            return put(self.anchor(href, self.format(m.group(1)), title))
+
+        text = re.sub(r"\[([^\[\]]+)\]\[([^\[\]]*)\]", ref_link, text)
+        text = re.sub(r"\[([^\[\]]+)\](?![(\[:])", lambda m: ref_link(m) if m.group(1).strip().lower() in self.refs
+                      else m.group(0), text)
+        text = self.format(text)
+        text = re.sub(r"(?<![\w\"'=>/\x00])(https?://[^\s<>\x00]+[^\s<>\x00.,;:!?)\]'\"])",
+                      lambda m: put(self.anchor(m.group(1), m.group(1))), text)
+        while "\x00" in text:
+            text = re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], text)
+        return text
+
+    @staticmethod
+    def format(text):
+        text = re.sub(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*", r"<strong><em>\1</em></strong>", text)
+        text = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"<strong>\1</strong>", text)
+        text = re.sub(r"(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)", r"<strong>\1</strong>", text)
+        text = re.sub(r"\*(?=\S)(.+?)(?<=\S)\*", r"<em>\1</em>", text)
+        text = re.sub(r"(?<!\w)_(?=\S)(.+?)(?<=\S)_(?!\w)", r"<em>\1</em>", text)
+        text = re.sub(r"~~(?=\S)(.+?)(?<=\S)~~", r"<del>\1</del>", text)
+        return text
+
+    # ---- blocks --------------------------------------------------------
+
+    def render(self, text, cur_dir="."):
+        self.cur_dir = cur_dir
+        self.headings, self.slugs, self.refs = [], {}, {}
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").expandtabs(4).split("\n")
+        if lines and lines[0].strip() == "---":
+            for j in range(1, min(len(lines), 60)):
+                if lines[j].strip() in ("---", "..."):
+                    lines = lines[j + 1:]
+                    break
+        kept = []
+        for line in lines:
+            m = re.match(r"^ {0,3}\[([^\]]+)\]:\s*<?(\S+?)>?(?:\s+[\"'(](.*?)[\"')])?\s*$", line)
+            if m:
+                self.refs[m.group(1).strip().lower()] = (m.group(2), m.group(3))
+            else:
+                kept.append(line)
+        return "\n".join(self.blocks(kept))
+
+    def starts_block(self, line):
+        return bool(FENCE_RE.match(line) or HEADING_RE.match(line) or HR_RE.match(line) or line.lstrip().startswith(">")
+                    or self.html_block_start(line))
+
+    @staticmethod
+    def html_block_start(line):
+        m = re.match(r"^ {0,3}</?([A-Za-z][A-Za-z0-9]*)(?:\s|/?>|$)", line)
+        return bool(m and m.group(1).lower() in BLOCK_TAGS)
+
+    def add_heading(self, level, raw):
+        inner = self.inline(raw.strip())
+        slug = base = slugify(inner)
+        count = self.slugs.get(base, 0)
+        self.slugs[base] = count + 1
+        if count:
+            slug = "%s-%d" % (base, count)
+        self.headings.append((level, slug, re.sub(r"<[^>]+>", "", html.unescape(inner))))
+        return '<h%d id="%s"><a class="anchor" href="#%s" aria-hidden="true">#</a>%s</h%d>' % (
+            level, slug, slug, inner, level)
+
+    def blocks(self, lines, tight=False):
+        out, para = [], []
+        i, n = 0, len(lines)
+
+        def flush():
+            if para:
+                text = self.inline("\n".join(p.lstrip() for p in para).strip())
+                out.append(text if tight else "<p>%s</p>" % text)
+                para.clear()
+
+        while i < n:
+            line = lines[i]
+            if not line.strip():
+                flush()
+                i += 1
+                continue
+            m = FENCE_RE.match(line)
+            if m:
+                flush()
+                fence, lang, ind = m.group(2), m.group(3), len(m.group(1))
+                body = []
+                i += 1
+                close_re = re.compile(r"^ {0,3}%s{%d,}\s*$" % (re.escape(fence[0]), len(fence)))
+                while i < n and not close_re.match(lines[i]):
+                    body.append(lines[i][min(ind, indent_of(lines[i])):])
+                    i += 1
+                i += 1
+                out.append(self.code_block("\n".join(body), lang))
+                continue
+            if para:
+                m = re.match(r"^ {0,3}(=+|-+)\s*$", line)
+                if m:
+                    level = 1 if m.group(1)[0] == "=" else 2
+                    text = "\n".join(para)
+                    para.clear()
+                    out.append(self.add_heading(level, text))
+                    i += 1
+                    continue
+            m = HEADING_RE.match(line)
+            if m:
+                flush()
+                out.append(self.add_heading(len(m.group(1)), m.group(2) or ""))
+                i += 1
+                continue
+            if HR_RE.match(line):
+                flush()
+                out.append("<hr>")
+                i += 1
+                continue
+            if re.match(r"^ {0,3}>", line):
+                flush()
+                quote = []
+                while i < n and re.match(r"^ {0,3}>", lines[i]):
+                    quote.append(re.sub(r"^ {0,3}> ?", "", lines[i]))
+                    i += 1
+                out.append(self.quote(quote))
+                continue
+            if "|" in line and i + 1 < n and TABLE_DELIM_RE.match(lines[i + 1]) and "-" in lines[i + 1]:
+                header = split_row(line)
+                delim = split_row(lines[i + 1])
+                if len(header) == len(delim):
+                    flush()
+                    rows = []
+                    i += 2
+                    while i < n and lines[i].strip() and "|" in lines[i]:
+                        rows.append(split_row(lines[i]))
+                        i += 1
+                    out.append(self.table(header, delim, rows))
+                    continue
+            m = LIST_RE.match(line)
+            if m and not (para and (m.group(3) == "" or (m.group(2)[0].isdigit() and not m.group(2).startswith("1")))):
+                flush()
+                html_list, i = self.parse_list(lines, i)
+                out.append(html_list)
+                continue
+            if not para and self.html_block_start(line):
+                chunk = []
+                while i < n and lines[i].strip():
+                    chunk.append(lines[i])
+                    i += 1
+                out.append(self.raw_html("\n".join(chunk)))
+                continue
+            if not para and line.startswith("    "):
+                chunk = []
+                while i < n and (lines[i].startswith("    ") or not lines[i].strip()):
+                    chunk.append(lines[i][4:])
+                    i += 1
+                while chunk and not chunk[-1].strip():
+                    chunk.pop()
+                out.append(self.code_block("\n".join(chunk), ""))
+                continue
+            para.append(line)
+            i += 1
+        flush()
+        return out
+
+    def code_block(self, code, lang):
+        label = html.escape(lang) if lang else "text"
+        return ('<div class="code"><div class="code-head"><span class="lang">%s</span>'
+                '<button class="copy" type="button">Copy</button></div><pre><code>%s</code></pre></div>'
+                % (label, highlight(code, lang)))
+
+    def quote(self, lines):
+        m = re.match(r"^\[!(%s)\]\s*$" % "|".join(ALERTS), lines[0].strip()) if lines else None
+        if m:
+            inner = "\n".join(self.blocks(lines[1:]))
+            return '<div class="alert alert-%s"><p class="alert-title">%s</p>%s</div>' % (
+                m.group(1).lower(), ALERTS[m.group(1)], inner)
+        return "<blockquote>%s</blockquote>" % "\n".join(self.blocks(lines))
+
+    def table(self, header, delim, rows):
+        aligns = []
+        for d in delim:
+            d = d.strip()
+            aligns.append("center" if d.startswith(":") and d.endswith(":") else
+                          "right" if d.endswith(":") else "left" if d.startswith(":") else "")
+
+        def cell(tag, text, a):
+            style = ' style="text-align:%s"' % a if a else ""
+            return "<%s%s>%s</%s>" % (tag, style, self.inline(text), tag)
+
+        out = ['<div class="table-wrap"><table><thead><tr>']
+        out += [cell("th", c, aligns[k]) for k, c in enumerate(header)]
+        out.append("</tr></thead><tbody>")
+        for row in rows:
+            row = (row + [""] * len(header))[:len(header)]
+            out.append("<tr>" + "".join(cell("td", c, aligns[k]) for k, c in enumerate(row)) + "</tr>")
+        out.append("</tbody></table></div>")
+        return "".join(out)
+
+    def parse_list(self, lines, i):
+        n = len(lines)
+        first = LIST_RE.match(lines[i])
+        ordered = first.group(2)[0].isdigit()
+        kind = first.group(2)[-1] if ordered else first.group(2)
+        start = int(first.group(2)[:-1]) if ordered else 1
+        items, loose, done = [], False, False
+        while i < n and not done:
+            m = LIST_RE.match(lines[i])
+            if not m or (m.group(2)[0].isdigit()) != ordered or (m.group(2)[-1] if ordered else m.group(2)) != kind:
+                break
+            indent, marker, spaces = len(m.group(1)), m.group(2), len(m.group(3))
+            if spaces == 0 or spaces > 4:
+                content_indent = indent + len(marker) + 1
+                first_line = lines[i][indent + len(marker):].strip() if spaces else ""
+            else:
+                content_indent = indent + len(marker) + spaces
+                first_line = lines[i][content_indent:]
+            item = [first_line]
+            i += 1
+            while i < n:
+                cur = lines[i]
+                if not cur.strip():
+                    j = i
+                    while j < n and not lines[j].strip():
+                        j += 1
+                    if j < n and indent_of(lines[j]) >= content_indent:
+                        item.extend([""] * (j - i))
+                        i = j
+                        continue
+                    sib = LIST_RE.match(lines[j]) if j < n else None
+                    if sib and indent_of(lines[j]) < content_indent and (sib.group(2)[0].isdigit()) == ordered:
+                        loose = True
+                        i = j
+                    else:
+                        done = True
+                        i = j if False else i
+                    break
+                if indent_of(cur) >= content_indent:
+                    item.append(cur[content_indent:])
+                    i += 1
+                    continue
+                if item and item[-1].strip() and not LIST_RE.match(cur) and not self.starts_block(cur):
+                    item.append(cur.lstrip())
+                    i += 1
+                    continue
+                break
+            items.append(item)
+        loose = loose or any("" in it[:-1] and any(x.strip() for x in it[it.index(""):]) for it in items if "" in it)
+        tag = "ol" if ordered else "ul"
+        attrs = ' start="%d"' % start if ordered and start != 1 else ""
+        li = []
+        for item in items:
+            box = ""
+            tm = re.match(r"^\[([ xX])\]\s+", item[0])
+            if tm:
+                box = '<input type="checkbox" disabled%s> ' % (" checked" if tm.group(1) in "xX" else "")
+                item = [item[0][tm.end():]] + item[1:]
+            inner = "\n".join(self.blocks(item, tight=not loose))
+            li.append("<li%s>%s%s</li>" % (' class="task"' if tm else "", box, inner))
+        return "<%s%s>\n%s\n</%s>" % (tag, attrs, "\n".join(li), tag), i
+
+
+# --------------------------------------------------------------------------
+# Page template
+# --------------------------------------------------------------------------
+
+CSS = r"""
+:root{--bg:#ffffff;--panel:#f6f8fa;--ink:#1f2328;--muted:#656d76;--line:#d8dee4;--accent:#0969da;--code-bg:#f6f8fa;
+--t-c:#6e7781;--t-s:#0a3069;--t-n:#0550ae;--t-k:#cf222e;--quote:#d0d7de;--mark:#fff8c5;color-scheme:light}
+:root[data-theme=dark]{--bg:#0d1117;--panel:#161b22;--ink:#e6edf3;--muted:#8d96a0;--line:#30363d;--accent:#58a6ff;--code-bg:#161b22;
+--t-c:#8b949e;--t-s:#a5d6ff;--t-n:#79c0ff;--t-k:#ff7b72;--quote:#3d444d;--mark:#5a4a00;color-scheme:dark}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:64px}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",sans-serif}
+.top{position:fixed;inset:0 0 auto 0;height:48px;display:flex;align-items:center;gap:10px;padding:0 14px;background:var(--bg);
+border-bottom:1px solid var(--line);z-index:10}
+.top .name{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top .meta{color:var(--muted);font-size:13px;white-space:nowrap}.top .sp{flex:1}
+.btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:5px 10px;font:inherit;font-size:13px;cursor:pointer}
+.btn:hover{border-color:var(--accent)}.btn[aria-pressed=true]{border-color:var(--accent);color:var(--accent)}
+.layout{display:flex;padding-top:48px;min-height:100vh}
+nav.toc{position:sticky;top:48px;align-self:flex-start;width:270px;flex:none;height:calc(100vh - 48px);overflow:auto;padding:18px 12px 30px 16px;
+border-right:1px solid var(--line);font-size:14px}
+nav.toc h4{margin:0 0 8px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+nav.toc a{display:block;padding:3px 8px;border-left:2px solid transparent;color:var(--muted);text-decoration:none;border-radius:0 6px 6px 0}
+nav.toc a:hover{color:var(--ink)}nav.toc a.on{color:var(--accent);border-left-color:var(--accent);background:var(--panel)}
+nav.toc a.l2{padding-left:20px}nav.toc a.l3{padding-left:32px}nav.toc a.l4{padding-left:44px}
+body.no-toc nav.toc{display:none}
+main{flex:1;min-width:0;padding:30px 28px 90px}
+article{max-width:840px;margin:0 auto;word-wrap:break-word}
+article h1,article h2,article h3,article h4,article h5,article h6{line-height:1.25;margin:1.6em 0 .6em;position:relative}
+article h1{font-size:2em;padding-bottom:.3em;border-bottom:1px solid var(--line);margin-top:0}
+article h2{font-size:1.5em;padding-bottom:.3em;border-bottom:1px solid var(--line)}article h3{font-size:1.25em}
+article h4{font-size:1em}article h5,article h6{font-size:.9em;color:var(--muted)}
+.anchor{position:absolute;left:-1.1em;color:var(--muted);text-decoration:none;opacity:0;font-weight:400}
+h1:hover .anchor,h2:hover .anchor,h3:hover .anchor,h4:hover .anchor{opacity:1}
+article p,article ul,article ol,article blockquote,article .code,article .table-wrap,article details,article .alert{margin:0 0 16px}
+article a{color:var(--accent);text-decoration:none}article a:hover{text-decoration:underline}
+article ul,article ol{padding-left:2em}article li+li{margin-top:.25em}article li>ul,article li>ol{margin:.25em 0 0}
+article li.task{list-style:none;margin-left:-1.4em}article li.task input{margin-right:.5em}
+article img{max-width:100%;height:auto;border-radius:6px}article hr{border:0;border-top:1px solid var(--line);margin:28px 0}
+article blockquote{padding:0 1em;color:var(--muted);border-left:.25em solid var(--quote)}
+article code{font:85% ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code-bg);padding:.2em .4em;border-radius:6px}
+.code{border:1px solid var(--line);border-radius:10px;background:var(--code-bg);overflow:hidden}
+.code-head{display:flex;justify-content:space-between;align-items:center;padding:4px 10px;border-bottom:1px solid var(--line);
+font-size:12px;color:var(--muted);background:var(--panel)}
+.code pre{margin:0;padding:14px 16px;overflow:auto}.code pre code{background:none;padding:0;font-size:13.5px;line-height:1.55;border-radius:0}
+.copy{border:0;background:none;color:var(--muted);font:inherit;cursor:pointer;padding:2px 6px;border-radius:6px}.copy:hover{color:var(--accent)}
+.t-c{color:var(--t-c);font-style:italic}.t-s{color:var(--t-s)}.t-n{color:var(--t-n)}.t-k{color:var(--t-k)}
+.table-wrap{overflow:auto}table{border-collapse:collapse;width:max-content;max-width:100%}
+th,td{padding:7px 13px;border:1px solid var(--line)}th{background:var(--panel);font-weight:650}tr:nth-child(even) td{background:var(--panel)}
+kbd{font:85% ui-monospace,monospace;padding:2px 6px;border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;background:var(--panel)}
+details{border:1px solid var(--line);border-radius:8px;padding:8px 14px;background:var(--panel)}summary{cursor:pointer;font-weight:600}
+.alert{padding:10px 16px;border-left:.25em solid var(--accent);border-radius:0 8px 8px 0;background:var(--panel)}
+.alert p{margin:0 0 8px}.alert p:last-child{margin:0}.alert-title{font-weight:650}
+.alert-tip{border-color:#1a7f37}.alert-important{border-color:#8250df}.alert-warning{border-color:#9a6700}.alert-caution{border-color:#cf222e}
+#src{display:none;max-width:840px;margin:0 auto;white-space:pre-wrap;font:13.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
+body.show-src #src{display:block}body.show-src article{display:none}
+@media (max-width:860px){nav.toc{display:none}main{padding:22px 16px 70px}.top .meta{display:none}}
+@media print{.top,nav.toc{display:none}.layout{padding:0}main{padding:0}}
+"""
+
+JS = r"""
+(function(){
+  var root=document.documentElement,body=document.body;
+  function qs(s){return document.querySelector(s)}
+  function api(p){return fetch(p,{credentials:'same-origin'}).then(function(r){return r.json()})}
+  function setTheme(t){root.setAttribute('data-theme',t);api('/api/theme?set='+t).catch(function(){})}
+  function effective(){var t=root.getAttribute('data-theme');if(t==='light'||t==='dark')return t;
+    return matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}
+  function toggleTheme(){setTheme(effective()==='dark'?'light':'dark')}
+  function toggleToc(){body.classList.toggle('no-toc');qs('#b-toc').setAttribute('aria-pressed',!body.classList.contains('no-toc'))}
+  function toggleSrc(){body.classList.toggle('show-src');qs('#b-src').setAttribute('aria-pressed',body.classList.contains('show-src'))}
+  qs('#b-theme').onclick=toggleTheme;qs('#b-toc').onclick=toggleToc;qs('#b-src').onclick=toggleSrc;
+  qs('#b-print').onclick=function(){window.print()};
+  document.addEventListener('keydown',function(e){
+    if(e.ctrlKey||e.metaKey||e.altKey||/input|textarea/i.test(e.target.tagName))return;
+    if(e.key==='t')toggleTheme();else if(e.key==='o')toggleToc();else if(e.key==='s')toggleSrc();
+  });
+  if(!document.querySelector('nav.toc a'))body.classList.add('no-toc');
+  document.querySelectorAll('.copy').forEach(function(b){b.onclick=function(){
+    var text=b.closest('.code').querySelector('code').innerText;
+    function done(){b.textContent='Copied!';setTimeout(function(){b.textContent='Copy'},1200)}
+    if(navigator.clipboard){navigator.clipboard.writeText(text).then(done,done)}else{
+      var t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();
+      try{document.execCommand('copy')}catch(e){}t.remove();done()}}});
+  var links=[].slice.call(document.querySelectorAll('nav.toc a'));
+  var heads=links.map(function(a){return document.getElementById(a.getAttribute('href').slice(1))});
+  function spy(){var cur=0;for(var i=0;i<heads.length;i++){if(heads[i]&&heads[i].getBoundingClientRect().top<120)cur=i}
+    links.forEach(function(a,i){a.classList.toggle('on',i===cur)})}
+  if(links.length){addEventListener('scroll',spy,{passive:true});spy()}
+  var last=null;
+  function poll(){api('/api/stat?f='+encodeURIComponent(DOC)).then(function(d){
+    if(last!==null&&d.m!==last)location.reload();last=d.m}).catch(function(){})}
+  poll();setInterval(poll,1000);
+})();
+"""
+
+
+def build_page(title, body, headings, doc_rel, raw_text, nonce, theme, source_label):
+    toc = "".join('<a class="l%d" href="#%s">%s</a>' % (lvl, slug, html.escape(txt))
+                  for lvl, slug, txt in headings if lvl <= 4)
+    words = len(re.sub(r"<[^>]+>", " ", body).split())
+    minutes = max(1, round(words / 220.0))
+    theme_attr = theme if theme in ("light", "dark") else "auto"
+    return """<!doctype html>
+<html lang="en" data-theme="%(theme)s">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' https: http: data:; style-src 'unsafe-inline'; script-src 'nonce-%(nonce)s'; connect-src 'self'">
+<title>%(title)s - viewme</title>
+<style>%(css)s</style>
+</head>
+<body>
+<header class="top">
+  <span class="name">%(title)s</span><span class="meta">%(source)s &middot; %(words)d words &middot; %(minutes)d min read</span>
+  <span class="sp"></span>
+  <button class="btn" id="b-toc" type="button" aria-pressed="true" title="Toggle outline (o)">Outline</button>
+  <button class="btn" id="b-src" type="button" aria-pressed="false" title="Toggle source (s)">Source</button>
+  <button class="btn" id="b-print" type="button" title="Print">Print</button>
+  <button class="btn" id="b-theme" type="button" title="Toggle theme (t)">Theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4>%(toc)s</nav>
+  <main>
+    <article>%(body)s</article>
+    <pre id="src">%(raw)s</pre>
+  </main>
+</div>
+<script nonce="%(nonce)s">var DOC=%(doc)s;%(js)s</script>
+</body>
+</html>
+""" % {"theme": theme_attr, "nonce": nonce, "title": html.escape(title), "css": CSS, "source": html.escape(source_label),
+       "words": words, "minutes": minutes, "toc": toc, "body": body, "raw": html.escape(raw_text),
+       "doc": json.dumps(doc_rel).replace("</", "<\\/"), "js": JS}
+
+
+# --------------------------------------------------------------------------
+# Local server
+# --------------------------------------------------------------------------
+
+def config_path():
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "viewme" / "config.json"
+
+
+def load_theme():
+    try:
+        return json.loads(config_path().read_text()).get("theme", "auto")
+    except (OSError, ValueError):
+        return "auto"
+
+
+def save_theme(theme):
+    try:
+        p = config_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"theme": theme}))
+    except OSError:
+        pass
+
+
+def find_root(path):
+    """Project root (nearest folder with .git) so relative images like ../img.png work."""
+    home = Path.home()
+    for parent in [path.parent] + list(path.parent.parents)[:6]:
+        if (parent / ".git").exists():
+            return parent
+        if parent == home:
+            break
+    return path.parent
+
+
+class App:
+    def __init__(self, root, main, stdin_text, theme):
+        self.root = root.resolve()
+        self.main = main
+        self.stdin_text = stdin_text
+        self.token = secrets.token_urlsafe(24)
+        self.theme = theme
+        self.last_ping = time.time()
+        self.seen_ping = False
+        self.port = 0
+        self.hosts = set()
+
+    def rel_of(self, path):
+        return path.resolve().relative_to(self.root).as_posix()
+
+    def resolve(self, rel):
+        try:
+            p = (self.root / urllib.parse.unquote(rel)).resolve()
+            p.relative_to(self.root)
+        except (ValueError, OSError):
+            return None
+        return p if p.is_file() else None
+
+    def render_doc(self, rel):
+        if rel is None:
+            text, title_fallback, source = self.stdin_text, "stdin", "stdin"
+            cur_dir = "."
+        else:
+            p = self.resolve(rel)
+            if p is None or not p.name.lower().endswith(DOC_SUFFIXES):
+                return None
+            text = p.read_text(encoding="utf-8", errors="replace")
+            title_fallback, source = p.name, str(p.parent if p.parent != self.root else self.root).replace(str(Path.home()), "~")
+            cur_dir = posixpath.dirname(rel) or "."
+        r = Renderer()
+        body = r.render(text, cur_dir)
+        title = next((t for lvl, _, t in r.headings if lvl == 1), title_fallback)
+        shown = title_fallback if title != title_fallback else title_fallback
+        return build_page(title if title != title_fallback else shown, body, r.headings, rel or "", text,
+                          secrets.token_urlsafe(16), self.theme, source + "/" + title_fallback if rel else source)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "viewme"
+
+    def log_message(self, *args):
+        pass
+
+    def send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        app = self.server.app
+        if self.headers.get("Host", "") not in app.hosts:
+            return self.send(403, "forbidden", "text/plain")
+        url = urllib.parse.urlsplit(self.path)
+        query = urllib.parse.parse_qs(url.query)
+        if url.path == "/" and secrets.compare_digest(query.get("k", [""])[0], app.token):
+            self.send_response(302)
+            self.send_header("Set-Cookie", "viewme=%s; Path=/; HttpOnly; SameSite=Strict" % app.token)
+            self.send_header("Location", "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        cookies = [c.strip() for c in self.headers.get("Cookie", "").split(";")]
+        if not any(secrets.compare_digest(c, "viewme=" + app.token) for c in cookies):
+            return self.send(403, "forbidden", "text/plain")
+
+        path = url.path
+        if path == "/":
+            page = app.render_doc(app.rel_of(app.main) if app.main else None)
+            return self.send(200, page)
+        if path.startswith("/doc/"):
+            page = app.render_doc(path[5:])
+            return self.send(200, page) if page else self.send(404, "not found", "text/plain")
+        if path.startswith("/raw/"):
+            p = app.resolve(path[5:])
+            if not p:
+                return self.send(404, "not found", "text/plain")
+            ctype = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+            if ctype in ("text/html", "application/xhtml+xml"):
+                ctype = "text/plain"
+            return self.send(200, p.read_bytes(), ctype,
+                             {"Content-Security-Policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"})
+        if path == "/api/stat":
+            app.last_ping, app.seen_ping = time.time(), True
+            rel = query.get("f", [""])[0]
+            p = app.resolve(rel) if rel else app.main
+            mtime = p.stat().st_mtime_ns if p and p.exists() else 0
+            return self.send(200, json.dumps({"m": mtime}), "application/json")
+        if path == "/api/theme":
+            theme = query.get("set", [""])[0]
+            if theme in ("light", "dark", "auto"):
+                app.theme = theme
+                save_theme(theme)
+            return self.send(200, "{}", "application/json")
+        return self.send(404, "not found", "text/plain")
+
+
+# --------------------------------------------------------------------------
+# Window launching
+# --------------------------------------------------------------------------
+
+CHROMIUM_NAMES = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "brave-browser",
+                  "microsoft-edge", "microsoft-edge-stable", "vivaldi"]
+
+
+def find_chromium():
+    override = os.environ.get("VIEWME_BROWSER")
+    if override:
+        return shutil.which(override) or override
+    for name in CHROMIUM_NAMES:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def serve(app, bind_host="127.0.0.1"):
+    server = http.server.ThreadingHTTPServer((bind_host, 0), Handler)
+    server.app = app
+    app.port = server.server_address[1]
+    app.hosts = {"127.0.0.1:%d" % app.port, "localhost:%d" % app.port}
+    return server
+
+
+def start(server):
+    """Start serving. Must run after any fork(): threads do not survive one."""
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="viewme", description="Open a Markdown file in a clean popup window.",
+                                 epilog="Keys in the window: t theme, o outline, s source.")
+    ap.add_argument("file", nargs="?", help='Markdown file to view, or "-" to read from stdin')
+    ap.add_argument("--theme", choices=("light", "dark", "auto"), help="color theme (remembered)")
+    ap.add_argument("--size", default="1000x820", metavar="WxH", help="window size (default 1000x820)")
+    ap.add_argument("--fg", action="store_true", help="stay in the foreground until the window closes")
+    ap.add_argument("--serve", action="store_true", help="only serve and print the URL, do not open a window")
+    ap.add_argument("-V", "--version", action="version", version="viewme " + VERSION)
+    args = ap.parse_args(argv)
+
+    if not args.file:
+        ap.print_usage(sys.stderr)
+        print("viewme: missing FILE (try: viewme README.md)", file=sys.stderr)
+        return 2
+
+    stdin_text, main_path = None, None
+    if args.file == "-":
+        if sys.stdin.isatty():
+            print("viewme: nothing piped to stdin", file=sys.stderr)
+            return 2
+        stdin_text = sys.stdin.read()
+        root = Path.cwd()
+    else:
+        main_path = Path(args.file).expanduser()
+        if not main_path.exists():
+            print("viewme: no such file: %s" % args.file, file=sys.stderr)
+            return 1
+        if not main_path.is_file():
+            print("viewme: not a file: %s" % args.file, file=sys.stderr)
+            return 1
+        main_path = main_path.resolve()
+        root = find_root(main_path)
+
+    if args.theme:
+        save_theme(args.theme)
+    app = App(root, main_path, stdin_text, args.theme or load_theme())
+    m = re.match(r"^(\d{3,5})[xX](\d{3,5})$", args.size)
+    width, height = (m.group(1), m.group(2)) if m else ("1000", "820")
+
+    browser = None
+    if not args.serve:
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or sys.platform == "darwin"):
+            print("viewme: no display found. Use --serve to get a URL instead.", file=sys.stderr)
+            return 1
+        browser = find_chromium()
+        if not browser and sys.platform == "darwin":
+            mac = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            browser = mac if os.path.exists(mac) else None
+
+    server = serve(app)
+    url = "http://127.0.0.1:%d/?k=%s" % (app.port, app.token)
+
+    if args.serve:
+        start(server)
+        print("viewme serving %s\n  %s\n(Ctrl-C to stop)" % (args.file, url), flush=True)
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            return 0
+
+    if not args.fg:
+        if os.fork() > 0:
+            server.server_close()   # the child keeps its own copy of the socket
+            return 0
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+
+    start(server)
+    if browser:
+        profile = tempfile.mkdtemp(prefix="viewme-")
+        cmd = [browser, "--app=" + url, "--user-data-dir=" + profile, "--no-first-run",
+               "--no-default-browser-check", "--window-size=%s,%s" % (width, height),
+               "--ozone-platform-hint=auto", "--class=viewme"]
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait()
+        finally:
+            shutil.rmtree(profile, ignore_errors=True)
+    else:
+        webbrowser.open(url)
+        deadline = time.time() + 120
+        while time.time() < deadline or (app.seen_ping and time.time() - app.last_ping < 180):
+            if app.seen_ping:
+                deadline = 0
+            time.sleep(2)
+    server.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,10 @@
+#compdef viewme
+# zsh completion for viewme
+_arguments -s \
+  '--theme=[color theme]:theme:(light dark auto)' \
+  '--size=[window size]:size:(1000x820 1280x800 800x600)' \
+  '--fg[stay in the foreground until the window closes]' \
+  '--serve[only serve and print the URL]' \
+  '(- *)'{-h,--help}'[show help]' \
+  '(- *)'{-V,--version}'[show version]' \
+  '*:markdown file:_files -g "*.(md|markdown|mdown|mkd|txt|MD)"'

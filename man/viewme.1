@@ -1,0 +1,95 @@
+.TH VIEWME 1 "September 2026" "viewme 1.0.0" "User Commands"
+.SH NAME
+viewme \- view a Markdown file in a clean popup window
+.SH SYNOPSIS
+.B viewme
+[\fIOPTIONS\fR]
+.I FILE.md
+.br
+.B viewme
+[\fIOPTIONS\fR]
+.B \-
+.SH DESCRIPTION
+.B viewme
+renders a Markdown file and shows it in its own small window, with no tabs or address bar.
+It needs no third-party packages: Markdown is rendered by a built-in renderer, served from a tiny web server on the loopback interface, and displayed in a Chromium-style
+.I app
+window (Google Chrome, Chromium, Brave, Edge or Vivaldi).
+If none of those is installed, the page opens in the default browser instead.
+.PP
+The command returns immediately and the window stays open on its own.
+When the window is closed the server exits.
+The page reloads by itself whenever the file changes on disk.
+.PP
+Use
+.B \-
+as the file name to read Markdown from standard input:
+.PP
+.RS
+.nf
+git log \-\-stat | viewme \-
+.fi
+.RE
+.SH FEATURES
+Headings with an outline sidebar and scroll tracking, tables with alignment, task lists, nested lists, blockquotes, GitHub-style alerts (\fB> [!NOTE]\fR), fenced code with light syntax highlighting and a copy button, images (including relative paths), links to other Markdown files, reference links, and a small safe subset of inline HTML (\fB<details>\fR, \fB<kbd>\fR, \fB<img>\fR and similar).
+Scripts, event handlers and \fBjavascript:\fR URLs are removed.
+.PP
+Relative images and links are served from the project root, which is the nearest parent folder containing
+.BR .git ,
+or else the folder of the file.
+Files outside that root are never served.
+.SH OPTIONS
+.TP
+.BR \-\-theme " " light | dark | auto
+Set the color theme. The choice is remembered.
+.TP
+.BI \-\-size " WxH"
+Window size in pixels. Default 1000x820.
+.TP
+.B \-\-fg
+Stay in the foreground until the window is closed.
+.TP
+.B \-\-serve
+Do not open a window. Serve the page and print its URL, for use with your own browser.
+.TP
+.BR \-h ", " \-\-help
+Show usage.
+.TP
+.BR \-V ", " \-\-version
+Show the version.
+.SH KEYS
+In the window:
+.TP
+.B t
+Toggle light and dark theme.
+.TP
+.B o
+Show or hide the outline.
+.TP
+.B s
+Show the raw Markdown source.
+.SH ENVIRONMENT
+.TP
+.B VIEWME_BROWSER
+Path or name of the browser to use instead of auto-detection. It must accept Chromium's
+.B \-\-app=URL
+flag to get the popup style.
+.TP
+.B XDG_CONFIG_HOME
+The theme is stored in
+.IR $XDG_CONFIG_HOME/viewme/config.json ,
+by default
+.IR ~/.config/viewme/config.json .
+.SH SECURITY
+The server listens on 127.0.0.1 only, on a random port.
+Every request needs a random per-run token that is handed to the window in a cookie, the Host header is checked, and the page carries a strict Content Security Policy.
+.SH EXIT STATUS
+0 on success, 1 if the file is missing or no display is available, 2 on a usage error.
+.SH EXAMPLES
+.nf
+viewme README.md
+viewme \-\-theme dark notes/todo.md
+viewme \-\-serve docs/guide.md
+.fi
+.SH SEE ALSO
+.BR cpop (1)
